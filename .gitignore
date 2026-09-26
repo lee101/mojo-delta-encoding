@@ -1,0 +1,6 @@
+dist/
+.pixi/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.so
