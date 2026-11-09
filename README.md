@@ -129,22 +129,24 @@ PYTHONPATH=python python -m pytest tests -q
 
 ## Performance
 
-Best of three runs per case, on a shared 36-core box, against the fastest
-reasonable NumPy formulation of each step: a vectorised bit-interleave for the
-curve, `np.argsort(kind="stable")` for the sort, `np.minimum.reduceat` for the
-grouped statistics, a broadcast comparison for the range counts, and a run-length
-encode for the prefix rank. Every case verifies its result against that
-reference before timing.
+Best of three runs per case, on a shared multi-core box (Intel Xeon E5-2697 v4,
+72 vCPU, verified 2026-11-09; see `bench/verify.md` for the per-run spread),
+against the fastest reasonable NumPy formulation of each step: a vectorised
+bit-interleave for the curve, `np.argsort(kind="stable")` for the sort,
+`np.minimum.reduceat` for the grouped statistics, a broadcast comparison for
+the range counts, and a run-length encode for the prefix rank. Every case
+verifies its result against that reference before timing, on the same input
+for both sides.
 
 | case | reference | mojo-delta-encoding | result |
 | --- | ---: | ---: | ---: |
-| zorder_keys n=2097152 k=3 b=20 | 1210.93 ms | 280.76 ms | 4.31x faster |
-| radix_sort n=2097152 | 468.93 ms | 647.48 ms | **0.72x, slower** |
-| file_bounds n=1048576 k=3 f=64 | 104.19 ms | 59.27 ms | 1.76x faster |
-| range_counts n=1048576 f=128 | 460.93 ms | 273.23 ms | 1.69x faster |
-| compaction_groups n=65536 | 42.87 ms | 22.24 ms | 1.93x faster |
-| prefix_rank n=4194304 b=30 | 237.24 ms | 25.06 ms | 9.47x faster |
-| zorder_rewrite n=1048576 f=32 | 658.32 ms | 315.94 ms | 2.08x faster |
+| zorder_keys n=2097152 k=3 b=20 | 542.79 ms | 127.10 ms | 4.27x faster |
+| radix_sort n=2097152 | 276.35 ms | 358.71 ms | **0.77x, slower** |
+| file_bounds n=1048576 k=3 f=64 | 47.58 ms | 19.55 ms | 2.43x faster |
+| range_counts n=1048576 f=128 | 330.09 ms | 149.03 ms | 2.21x faster |
+| compaction_groups n=65536 | 20.77 ms | 10.05 ms | 2.07x faster |
+| prefix_rank n=4194304 b=30 | 161.82 ms | 14.81 ms | 10.93x faster |
+| zorder_rewrite n=1048576 f=32 | 340.19 ms | 140.53 ms | 2.42x faster |
 
 The radix sort is a genuine loss and is reported as one. NumPy's stable integer
 sort is itself a radix sort and its digit loop vectorises, while this kernel
