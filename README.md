@@ -140,13 +140,13 @@ for both sides.
 
 | case | reference | mojo-delta-encoding | result |
 | --- | ---: | ---: | ---: |
-| zorder_keys n=2097152 k=3 b=20 | 542.79 ms | 127.10 ms | 4.27x faster |
-| radix_sort n=2097152 | 276.35 ms | 358.71 ms | **0.77x, slower** |
-| file_bounds n=1048576 k=3 f=64 | 47.58 ms | 19.55 ms | 2.43x faster |
-| range_counts n=1048576 f=128 | 330.09 ms | 149.03 ms | 2.21x faster |
-| compaction_groups n=65536 | 20.77 ms | 10.05 ms | 2.07x faster |
-| prefix_rank n=4194304 b=30 | 161.82 ms | 14.81 ms | 10.93x faster |
-| zorder_rewrite n=1048576 f=32 | 340.19 ms | 140.53 ms | 2.42x faster |
+| zorder_keys n=2097152 k=3 b=20 | 561.81 ms | 133.34 ms | 4.21x faster |
+| radix_sort n=2097152 | 286.89 ms | 366.29 ms | **0.78x, slower** |
+| file_bounds n=1048576 k=3 f=64 | 46.95 ms | 18.06 ms | 2.60x faster |
+| range_counts n=1048576 f=128 | 303.47 ms | 147.89 ms | 2.05x faster |
+| compaction_groups n=65536 | 20.47 ms | 9.99 ms | 2.05x faster |
+| prefix_rank n=4194304 b=30 | 158.42 ms | 14.98 ms | 10.58x faster |
+| zorder_rewrite n=1048576 f=32 | 350.29 ms | 137.04 ms | 2.56x faster |
 
 The radix sort is a genuine loss and is reported as one. NumPy's stable integer
 sort is itself a radix sort and its digit loop vectorises, while this kernel
