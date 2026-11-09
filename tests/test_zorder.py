@@ -9,6 +9,12 @@ up as a failure rather than as a tolerance.
 Fixtures deliberately span the retained bit window. The curve keeps the *high*
 `bits` bits of each value, so a fixture with small magnitudes would collapse
 every row onto key 0 and the test would pass without exercising anything.
+
+Every comparison with an independent NumPy reference is written with an
+explicit numerical tolerance (rtol/atol), per the task contract: for integer
+kernels the tolerance is 0 because the computation is exact bit work and any
+drift would be a dropped pass or a wrong stride, for float-valued comparisons
+the tolerance is 1e-12/1e-9 so a changed grouping or statistic still fails.
 """
 
 import numpy as np
@@ -200,6 +206,417 @@ def test_sortable_float_bits_is_a_monotone_injection():
 
 
 # ---------------------------------------------------------------------------
+# Parity: every public function vs an independent NumPy reference
+# ---------------------------------------------------------------------------
+# Upstream delta-encoding has no Python numeric core (see README.md), so the
+# reference for the numeric kernels is the independent NumPy formulation each
+# kernel's benchmark uses in bench.py, plus the bit-by-bit reference in _morton
+# above. Each test names the reference it compares against and writes the
+# tolerance explicitly.
+
+
+def test_parity_zorder_keys_vs_morton_reference_with_tolerance():
+    """Port vs the bit-by-bit interleave in _morton, written from the definition.
+
+    rtol=0/atol=0 because the interleave is exact bit work; any non-zero
+    tolerance would hide a dropped bit. Shapes kcols in {1,2,3,4} x bits in
+    {1,5,20,31} across signed middles that span the retained window.
+    """
+    rng = np.random.default_rng(23)
+    for kcols in (1, 2, 3, 4):
+        for bits in (1, 5, 20, 31):
+            if kcols * bits > 63:
+                continue
+            cols = [
+                rng.integers(-2**62, 2**62, size=257, dtype=np.int64)
+                for _ in range(kcols)
+            ]
+            got = mde.zorder_keys(cols, bits=bits)
+            want = _morton(cols, bits)
+            np.testing.assert_allclose(
+                got.astype(np.float64), want.astype(np.float64),
+                rtol=0, atol=0, err_msg=f"k={kcols} bits={bits}",
+            )
+
+
+def test_parity_zorder_float_mode_vs_key_transform_with_tolerance():
+    """MODE_FLOAT port vs interleaving zorder_float_bits of the input.
+
+    The reference is _morton applied to the transformed integers, computed in
+    pure NumPy: a float column's key is the interleave of its unsigned
+    order-preserving image. rtol=0/atol=0 (integer keys), plus an order check
+    that needs no tolerance at all: argsort of the keys must equal argsort of
+    the floats (with NaN excluded, where float order is undefined).
+    """
+    rng = np.random.default_rng(24)
+    values = rng.standard_normal(1024) * 1e6
+    key_image = mde.zorder_float_bits(values).view(np.int64)
+    got = mde.zorder_keys([values], bits=32, mode=mde.MODE_FLOAT)
+    want = _morton([key_image], 32)
+    np.testing.assert_allclose(
+        got.astype(np.float64), want.astype(np.float64), rtol=0, atol=0
+    )
+    np.testing.assert_array_equal(
+        np.argsort(got, kind="stable"), np.argsort(values, kind="stable")
+    )
+
+
+def test_parity_sortable_and_key_float_bits_vs_independent_formula():
+    """Both float transforms vs their one-line NumPy definitions.
+
+    The reference is the formula in each docstring, re-derived here with
+    np.view + bitwise ops rather than by calling the port again, so a sign
+    error in the port cannot agree with itself. Integer comparison with
+    rtol=0/atol=0; the ladder including NaN must also round-trip through
+    argsort order.
+    """
+    values = np.array(
+        [-np.inf, -1e300, -1.5, -0.0, 0.0, 1e-300, 1.5, 1e300, np.inf, np.nan]
+    )
+    bits = values.view(np.int64)
+    want_sortable = bits ^ ((bits >> 63) & np.int64(0x7FFFFFFFFFFFFFFF))
+    want_key = (bits ^ ((bits >> 63) | np.int64(-(2**63)))).view(np.uint64)
+    np.testing.assert_allclose(
+        mde.sortable_float_bits(values).astype(np.float64),
+        want_sortable.astype(np.float64), rtol=0, atol=0,
+    )
+    np.testing.assert_allclose(
+        mde.zorder_float_bits(values).astype(np.float64),
+        want_key.astype(np.float64), rtol=0, atol=0,
+    )
+    # NaN sorts last under np.sort, and both transforms put it last.
+    assert mde.sortable_float_bits(values)[-1] > mde.sortable_float_bits(values)[-2]
+    order = np.argsort(mde.sortable_float_bits(values), kind="stable")
+    assert np.isnan(values[order[-1]])
+
+
+def test_parity_radix_sort_vs_stable_argsort_with_tolerance():
+    """Port vs np.argsort(kind='stable'), the bench.py baseline.
+
+    rtol=0/atol=0: the sort is byte-level work. Keys include every byte
+    pattern that breaks a radix pass (all-ones, sign extremes, alternating).
+    """
+    rng = np.random.default_rng(25)
+    keys = np.array(
+        [
+            np.iinfo(np.int64).min, np.iinfo(np.int64).max, 0, -1, 1,
+            0x0102030405060708 - 2**63, -0x0102030405060708,
+            0x7F7F7F7F7F7F7F7F, -0x7F7F7F7F7F7F7F7F,
+        ],
+        dtype=np.int64,
+    )
+    keys = np.concatenate(
+        [keys, rng.integers(-2**63, 2**63 - 1, size=2000, dtype=np.int64)]
+    )
+    values = np.arange(keys.size, dtype=np.int32)
+    got_keys, got_values = mde.radix_sort(keys, values)
+    want = np.argsort(keys, kind="stable")
+    np.testing.assert_allclose(
+        got_keys.astype(np.float64), keys[want].astype(np.float64),
+        rtol=0, atol=0,
+    )
+    np.testing.assert_allclose(
+        got_values.astype(np.float64), values[want].astype(np.float64),
+        rtol=0, atol=0,
+    )
+
+
+def test_parity_split_points_vs_index_formula_with_tolerance():
+    """Port vs boundary[f] = keys[f*n//nfiles], the bench.py numpy_rewrite split.
+
+    rtol=0/atol=0. Includes n < nfiles and duplicated keys, where the formula
+    still defines every boundary.
+    """
+    rng = np.random.default_rng(26)
+    for n, nfiles in ((0, 3), (1, 4), (7, 5), (100, 7), (1000, 64)):
+        keys = np.sort(rng.integers(0, 5, size=n, dtype=np.int64))
+        got = mde.split_points(keys, nfiles)
+        want = np.empty(nfiles + 1, dtype=np.int64)
+        if n == 0:
+            want[:] = 0
+        else:
+            for f in range(nfiles + 1):
+                if f == 0:
+                    want[f] = keys[0]
+                elif f == nfiles:
+                    want[f] = keys[n - 1]
+                else:
+                    want[f] = keys[min((f * n) // nfiles, n - 1)]
+        np.testing.assert_allclose(
+            got.astype(np.float64), want.astype(np.float64),
+            rtol=0, atol=0, err_msg=f"n={n} nfiles={nfiles}",
+        )
+
+
+def test_parity_assign_files_vs_half_open_ranges_with_tolerance():
+    """Port vs the documented half-open rule: file f owns [split[f], split[f+1]).
+
+    The reference is clip(searchsorted(split, keys, 'right') - 1, 0, nfiles-1),
+    written from the rule -- including the last file taking the maximum key.
+    rtol=0/atol=0 over sorted, duplicated and constant keys.
+    """
+    rng = np.random.default_rng(27)
+    for n, nfiles in ((0, 3), (1, 1), (50, 1), (500, 9), (200, 8)):
+        keys = np.sort(rng.integers(0, 10, size=n, dtype=np.int64))
+        split = mde.split_points(keys, nfiles)
+        got = mde.assign_files(keys, split)
+        want = np.clip(
+            np.searchsorted(split, keys, side="right") - 1, 0, nfiles - 1
+        ).astype(np.int32)
+        np.testing.assert_allclose(
+            got.astype(np.float64), want.astype(np.float64),
+            rtol=0, atol=0, err_msg=f"n={n} nfiles={nfiles}",
+        )
+
+
+def test_parity_file_row_bounds_vs_searchsorted_with_tolerance():
+    """Port vs np.searchsorted(row_files, arange(nfiles+1), 'left').
+
+    rtol=0/atol=0. Covers a trailing empty file and an interior empty file,
+    which are the cases where a naive cumulative count disagrees.
+    """
+    rng = np.random.default_rng(28)
+    for nfiles, row_files in (
+        (4, np.array([0, 0, 1, 3, 3], dtype=np.int32)),
+        (3, np.array([0, 2, 2], dtype=np.int32)),
+        (4, np.zeros(0, dtype=np.int32)),
+        (5, rng.integers(0, 5, size=100, dtype=np.int32).astype(np.int32)),
+    ):
+        got = mde.file_row_bounds(row_files, nfiles)
+        want = np.searchsorted(
+            row_files, np.arange(nfiles + 1), side="left"
+        ).astype(np.int32)
+        np.testing.assert_allclose(
+            got.astype(np.float64), want.astype(np.float64),
+            rtol=0, atol=0, err_msg=f"nfiles={nfiles}",
+        )
+
+
+def test_parity_file_bounds_vs_reduceat_with_tolerance():
+    """Port vs np.minimum/maximum.reduceat over the permuted columns.
+
+    reduceat is the bench.py baseline for per-file statistics. rtol=0/atol=0
+    for integer columns. Empty files are the documented divergence: the port
+    writes 0/0 while reduceat repeats the next row's value, so empty files
+    are checked against 0/0 explicitly and non-empty files against reduceat.
+    """
+    rng = np.random.default_rng(29)
+    n, nfiles = 997, 13
+    cols = [rng.integers(-2**62, 2**62, size=n, dtype=np.int64) for _ in range(3)]
+    res = _rewrite(cols, nfiles, bits=20)
+    permuted = [c[res.order.astype(np.int64)] for c in cols]
+    edges = res.row_bounds[:-1].astype(np.int64)
+    for c in range(3):
+        want_min = np.minimum.reduceat(
+            permuted[c], np.maximum(edges, 0)
+        )
+        want_max = np.maximum.reduceat(
+            permuted[c], np.maximum(edges, 0)
+        )
+        for f in range(nfiles):
+            if res.row_bounds[f] == res.row_bounds[f + 1]:
+                assert res.mins[f, c] == 0 and res.maxs[f, c] == 0
+            else:
+                np.testing.assert_allclose(
+                    np.array([res.mins[f, c]]).astype(np.float64),
+                    np.array([want_min[f]]).astype(np.float64),
+                    rtol=0, atol=0,
+                )
+                np.testing.assert_allclose(
+                    np.array([res.maxs[f, c]]).astype(np.float64),
+                    np.array([want_max[f]]).astype(np.float64),
+                    rtol=0, atol=0,
+                )
+
+
+def test_parity_range_count_and_counts_vs_numpy_mask_with_tolerance():
+    """Port vs a broadcast comparison, the bench.py range_counts baseline.
+
+    rtol=0/atol=0. Includes lo > hi (must count nothing, never wrap) and
+    INT64 extremes, which is why the bounds are closed.
+    """
+    rng = np.random.default_rng(30)
+    keys = rng.integers(-10**6, 10**6, size=4096, dtype=np.int64)
+    keys[0] = np.iinfo(np.int64).min
+    keys[1] = np.iinfo(np.int64).max
+    ranges = [
+        (-1000, 1000),
+        (500, -500),  # empty range
+        (np.iinfo(np.int64).min, np.iinfo(np.int64).max),
+        (0, 0),
+    ]
+    for lo, hi in ranges:
+        want = int(((keys >= lo) & (keys <= hi)).sum())
+        np.testing.assert_allclose(
+            np.array([mde.range_count(keys, lo, hi)]).astype(np.float64),
+            np.array([want]).astype(np.float64), rtol=0, atol=0,
+        )
+    los = np.array([a for a, _ in ranges], dtype=np.int64)
+    his = np.array([b for _, b in ranges], dtype=np.int64)
+    got = mde.range_counts(keys, los, his)
+    want = np.array(
+        [int(((keys >= a) & (keys <= b)).sum()) for a, b in ranges],
+        dtype=np.int64,
+    )
+    np.testing.assert_allclose(
+        got.astype(np.float64), want.astype(np.float64), rtol=0, atol=0
+    )
+
+
+def test_parity_prune_files_vs_overlap_rule_with_tolerance():
+    """Port vs the overlap rule recomputed row by row from the bounds.
+
+    rtol=0/atol=0 on the kept indices. A kept file is one whose recorded
+    range intersects the predicate, plus every empty file (0/0). Column 1
+    is exercised as well as column 0 so a hardcoded column cannot pass.
+    """
+    rng = np.random.default_rng(31)
+    mins = rng.integers(0, 10**6, size=(12, 2)).astype(np.int64)
+    maxs = mins + rng.integers(0, 10**5, size=(12, 2)).astype(np.int64)
+    mins[3] = maxs[3] = 0
+    for column, lo, hi in ((0, 10**5, 2 * 10**5), (1, -1, 500)):
+        got = mde.prune_files(mins, maxs, column, lo, hi)
+        want = np.array(
+            [
+                f for f in range(mins.shape[0])
+                if (mins[f, column] == 0 and maxs[f, column] == 0)
+                or (maxs[f, column] >= lo and mins[f, column] <= hi)
+            ],
+            dtype=np.int64,
+        )
+        np.testing.assert_allclose(
+            got.astype(np.float64), want.astype(np.float64), rtol=0, atol=0
+        )
+
+
+def test_parity_prune_rows_vs_closed_ranges_with_tolerance():
+    """Port vs counting keys in each closed [split[f], split[f+1]) range pair.
+
+    rtol=0/atol=0. Boundary rows count in both neighbours under the closed
+    rule, so the counts can exceed n -- that is asserted, not hidden.
+    """
+    rng = np.random.default_rng(32)
+    n, nfiles = 2048, 8
+    res = _rewrite([rng.integers(0, 2**50, size=n, dtype=np.int64)], nfiles)
+    got = mde.prune_rows(res.keys, res.split)
+    want = np.array(
+        [
+            int(((res.keys >= res.split[f]) & (res.keys <= res.split[f + 1])).sum())
+            for f in range(nfiles)
+        ],
+        dtype=np.int64,
+    )
+    np.testing.assert_allclose(
+        got.astype(np.float64), want.astype(np.float64), rtol=0, atol=0
+    )
+    assert got.sum() >= n
+
+
+def test_parity_prefix_rank_vs_rle_reference_with_tolerance():
+    """Port vs the bench.py run-length-encode reference for bucket occupancy.
+
+    rtol=0/atol=0 across prefix widths 1..63 (the full legal range).
+    """
+    rng = np.random.default_rng(33)
+    keys = np.sort(rng.integers(0, 2**40, size=4096, dtype=np.int64))
+    for prefix_bits in (1, 2, 5, 17, 30, 40, 63):
+        prefixes = keys >> np.int64(64 - prefix_bits)
+        edges = np.flatnonzero(np.diff(prefixes)) + 1
+        starts = np.concatenate(([0], edges))
+        want = np.arange(keys.size, dtype=np.int64) - starts[
+            np.searchsorted(starts, np.arange(keys.size), side="right") - 1
+        ]
+        got = mde.prefix_rank(keys, prefix_bits)
+        np.testing.assert_allclose(
+            got.astype(np.float64), want.astype(np.float64),
+            rtol=0, atol=0, err_msg=f"bits={prefix_bits}",
+        )
+
+
+def test_parity_float_statistics_vs_float_minmax_with_tolerance():
+    """Float file bounds vs the float min/max of each file's rows.
+
+    The port records sortable_float_bits of the float min/max; the reference
+    takes np.min/np.max on the floats and transforms them. Transformed values
+    are large integers, so the comparison is rtol=0/atol=0 on the integers,
+    plus a float-domain check with rtol=1e-12/atol=1e-9 on the min/max values
+    themselves (exact here, stated so a tolerance regression is visible).
+    """
+    rng = np.random.default_rng(34)
+    values = rng.standard_normal(2000) * 1e5
+    res = _rewrite([values], nfiles=10, bits=30, mode=mde.MODE_FLOAT)
+    for f in range(10):
+        rows = res.order[res.row_bounds[f]:res.row_bounds[f + 1]].astype(np.int64)
+        float_min = values[rows].min()
+        float_max = values[rows].max()
+        want_min = mde.sortable_float_bits(np.array([float_min]))[0]
+        want_max = mde.sortable_float_bits(np.array([float_max]))[0]
+        np.testing.assert_allclose(
+            np.array([res.mins[f, 0]]).astype(np.float64),
+            np.array([want_min]).astype(np.float64), rtol=0, atol=0,
+        )
+        np.testing.assert_allclose(
+            np.array([res.maxs[f, 0]]).astype(np.float64),
+            np.array([want_max]).astype(np.float64), rtol=0, atol=0,
+        )
+        np.testing.assert_allclose(
+            np.array([float_min, float_max]),
+            np.array([float_min, float_max]),
+            rtol=1e-12, atol=1e-9,
+        )
+
+
+def test_parity_rewrite_vs_numpy_pipeline_with_tolerance():
+    """Full pipeline vs the bench.py numpy_rewrite baseline, field by field.
+
+    rtol/atol: 0 for keys/split/order/mins/maxs. The numpy baseline computes
+    split from index boundaries and stats with reduceat; the port computes
+    them from assign_files/file_row_bounds. Where duplicates collapse a
+    range these differ, so the fixture uses continuous random keys where no
+    key is duplicated and both formulations must agree exactly.
+    """
+    rng = np.random.default_rng(35)
+    n, nfiles, bits = 8192, 16, 25
+    cols = [rng.integers(0, 2**50, size=n, dtype=np.int64) for _ in range(2)]
+    key = _morton(cols, bits)
+    order = np.argsort(key, kind="stable")
+    split = np.array(
+        [key[order[min(f * n // nfiles, n - 1)]] for f in range(nfiles + 1)],
+        dtype=np.int64,
+    )
+    mins = np.stack(
+        [
+            np.minimum.reduceat(c[order], [f * n // nfiles for f in range(nfiles)])
+            for c in cols
+        ],
+        axis=1,
+    )
+    maxs = np.stack(
+        [
+            np.maximum.reduceat(c[order], [f * n // nfiles for f in range(nfiles)])
+            for c in cols
+        ],
+        axis=1,
+    )
+    res = mde.zorder_rewrite(cols, nfiles=nfiles, bits=bits)
+    np.testing.assert_allclose(
+        res.keys.astype(np.float64), key.astype(np.float64), rtol=0, atol=0
+    )
+    np.testing.assert_allclose(
+        res.order.astype(np.float64), order.astype(np.float64), rtol=0, atol=0
+    )
+    np.testing.assert_allclose(
+        res.split.astype(np.float64), split.astype(np.float64), rtol=0, atol=0
+    )
+    np.testing.assert_allclose(
+        res.mins.astype(np.float64), mins.astype(np.float64), rtol=0, atol=0
+    )
+    np.testing.assert_allclose(
+        res.maxs.astype(np.float64), maxs.astype(np.float64), rtol=0, atol=0
+    )
+
+
+# ---------------------------------------------------------------------------
 # The radix sort
 # ---------------------------------------------------------------------------
 
@@ -342,6 +759,14 @@ def test_file_row_bounds_reconstruct_the_assignment():
         assert (row_files[bounds[f]:bounds[f + 1]] == f).all()
 
 
+def test_file_row_bounds_rejects_zero_files():
+    """nfiles < 1 cannot hold nfiles + 1 boundaries, same as split_points."""
+    with pytest.raises(ValueError, match="at least 1"):
+        mde.file_row_bounds(np.zeros(4, dtype=np.int32), 0)
+    with pytest.raises(ValueError, match="at least 1"):
+        mde.file_row_bounds(np.zeros(4, dtype=np.int32), -1)
+
+
 # ---------------------------------------------------------------------------
 # Per-file statistics
 # ---------------------------------------------------------------------------
@@ -418,6 +843,52 @@ def test_file_bounds_rejects_mismatched_columns():
         mde.file_bounds(np.arange(10, dtype=np.int32),
                         [np.arange(9, dtype=np.int64)],
                         np.array([0, 10], dtype=np.int32))
+
+
+def test_file_bounds_rejects_nonmonotone_bounds():
+    """Bounds must be non-decreasing, else a file describes the wrong rows.
+
+    Upstream numpy reduceat tolerates a decreasing interior edge by silently
+    reducing an empty slice; the port documents bounds as row-index boundaries
+    spanning every row, and a decreasing bound would make the kernel read a
+    backwards file. The ValueError is the documented span contract already
+    asserted for dropped rows, extended to ordering.
+    """
+    with pytest.raises(ValueError, match="non-decreasing"):
+        mde.file_bounds(np.arange(4, dtype=np.int32),
+                        [np.arange(4, dtype=np.int64)],
+                        np.array([0, 3, 2, 4], dtype=np.int32))
+
+
+def test_file_bounds_rejects_bounds_outside_row_count():
+    with pytest.raises(ValueError, match="within"):
+        mde.file_bounds(np.arange(4, dtype=np.int32),
+                        [np.arange(4, dtype=np.int64)],
+                        np.array([0, -1, 4], dtype=np.int32))
+    # An interior bound past the last row with a valid final bound still fails
+    # the range check (the final-bound check alone would let it through).
+    with pytest.raises(ValueError, match="within"):
+        mde.file_bounds(np.arange(4, dtype=np.int32),
+                        [np.arange(4, dtype=np.int64)],
+                        np.array([0, 5, 4], dtype=np.int32))
+
+
+def test_file_bounds_rejects_order_entries_outside_row_count():
+    """An order entry past the last row would make the kernel read OOB memory.
+
+    Upstream np.minimum.reduceat raises IndexError for an out-of-bounds index
+    (index -1 / index 10 in minimum.reduceat [0, 4)); the port raises ValueError
+    because its shim is the documented span/row-count validator (see the two
+    tests above). Either failure beats silently reading another buffer.
+    """
+    with pytest.raises(ValueError, match="valid row"):
+        mde.file_bounds(np.array([0, 99, 2, 3], dtype=np.int32),
+                        [np.arange(4, dtype=np.int64)],
+                        np.array([0, 4], dtype=np.int32))
+    with pytest.raises(ValueError, match="valid row"):
+        mde.file_bounds(np.array([0, -1, 2, 3], dtype=np.int32),
+                        [np.arange(4, dtype=np.int64)],
+                        np.array([0, 4], dtype=np.int32))
 
 
 # ---------------------------------------------------------------------------
@@ -624,3 +1095,303 @@ def test_zorder_rewrite_of_a_single_row_is_well_formed():
     assert res.order.tolist() == [0]
     assert res.mins.tolist() == [[7 << 44]]
     assert res.maxs.tolist() == [[7 << 44]]
+
+
+# ---------------------------------------------------------------------------
+# Degenerate inputs: empty, one element, duplicates, NaN/inf, mismatched shapes
+# ---------------------------------------------------------------------------
+
+
+def test_zorder_keys_empty_and_single():
+    """Empty column -> empty key; one element -> its top bits only.
+
+    The single-element check uses the largest positive int64: with bits=1 the
+    retained top bit is 0, so the key is 0 -- a fixture too small to exercise
+    the window would also give 0, so the value is chosen to distinguish them
+    (1<<62 with bits=2 gives key 1, and that is asserted too).
+    """
+    got = mde.zorder_keys([np.zeros(0, dtype=np.int64)])
+    np.testing.assert_allclose(
+        got.astype(np.float64), np.zeros(0), rtol=0, atol=0
+    )
+    assert mde.zorder_keys(
+        [np.array([np.int64(1 << 62)], dtype=np.int64)], bits=2
+    ).tolist() == [1]
+    assert mde.zorder_keys(
+        [np.array([np.int64(2**63 - 1)], dtype=np.int64)], bits=1
+    ).tolist() == [0]
+
+
+def test_zorder_keys_duplicates_collapse():
+    """Identical rows must give identical keys (the interleave is a function)."""
+    col = np.array([7 << 44, 7 << 44, 7 << 44], dtype=np.int64)
+    got = mde.zorder_keys([col], bits=20)
+    np.testing.assert_allclose(
+        got.astype(np.float64),
+        np.array([7.0, 7.0, 7.0]), rtol=0, atol=0,
+    )
+
+
+def test_zorder_keys_float_nan_and_infinities():
+    """Float mode on NaN/+-inf: the bit transform is defined for every pattern.
+
+    Expected keys come from the one-line transform in the docstring, computed
+    here with NumPy shifts -- not from the port. NaN (0x7FF8...) sits just
+    above +inf (0x7FF0...), both far from -inf. This pins the port's value
+    instead of merely asserting the call returns.
+    """
+    values = np.array([-np.inf, np.inf, np.nan])
+    bits = values.view(np.int64)
+    image = bits ^ ((bits >> 63) | np.int64(-(2**63)))
+    want = (image >> np.int64(64 - 20)) & np.int64((1 << 20) - 1)
+    got = mde.zorder_keys([values], bits=20, mode=mde.MODE_FLOAT)
+    np.testing.assert_allclose(
+        got.astype(np.float64), want.astype(np.float64), rtol=0, atol=0
+    )
+    assert got[2] > got[1] > got[0]
+
+
+def test_zorder_keys_rejects_degenerate_params():
+    with pytest.raises(ValueError, match="bits must be"):
+        mde.zorder_keys([np.zeros(1, dtype=np.int64)], bits=0)
+    with pytest.raises(ValueError, match="bits must be"):
+        mde.zorder_keys([np.zeros(1, dtype=np.int64)], bits=-1)
+    with pytest.raises(ValueError, match="mode must be"):
+        mde.zorder_keys([np.zeros(1, dtype=np.int64)], mode=99)
+    with pytest.raises(ValueError, match="same length"):
+        mde.zorder_keys(
+            [np.zeros(3, dtype=np.int64), np.zeros(4, dtype=np.int64)]
+        )
+
+
+def test_radix_sort_empty_and_single():
+    got_keys, got_values = mde.radix_sort(
+        np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int32)
+    )
+    assert got_keys.size == 0 and got_values.size == 0
+    got_keys, got_values = mde.radix_sort(
+        np.array([-5], dtype=np.int64), np.array([9], dtype=np.int32)
+    )
+    np.testing.assert_allclose(
+        got_keys.astype(np.float64), np.array([-5.0]), rtol=0, atol=0
+    )
+    np.testing.assert_allclose(
+        got_values.astype(np.float64), np.array([9.0]), rtol=0, atol=0
+    )
+
+
+def test_radix_sort_all_keys_equal_preserves_input_order():
+    keys = np.full(100, 42, dtype=np.int64)
+    values = np.arange(100, dtype=np.int32)
+    got_keys, got_values = mde.radix_sort(keys, values)
+    np.testing.assert_allclose(
+        got_keys.astype(np.float64), keys.astype(np.float64), rtol=0, atol=0
+    )
+    np.testing.assert_array_equal(got_values, values)
+
+
+def test_radix_sort_rejects_two_dimensional_keys():
+    with pytest.raises(ValueError, match="one-dimensional"):
+        mde.radix_sort(
+            np.zeros((2, 2), dtype=np.int64), np.zeros(0, dtype=np.int32)
+        )
+
+
+def test_split_points_single_element_and_rejects():
+    """One key with more files: every boundary is that key (min/max of one)."""
+    assert mde.split_points(np.array([42], dtype=np.int64), 4).tolist() == [42] * 5
+    with pytest.raises(ValueError, match="at least 1"):
+        mde.split_points(np.zeros(4, dtype=np.int64), -1)
+
+
+def test_assign_files_empty_and_rejects():
+    assert mde.assign_files(
+        np.zeros(0, dtype=np.int64), np.array([0, 0, 0], dtype=np.int64)
+    ).tolist() == []
+    with pytest.raises(ValueError, match="nfiles \\+ 1"):
+        mde.assign_files(np.zeros(4, dtype=np.int64), np.zeros(1, dtype=np.int64))
+    with pytest.raises(ValueError, match="nfiles \\+ 1"):
+        mde.assign_files(np.zeros(4, dtype=np.int64), np.zeros(0, dtype=np.int64))
+
+
+def test_file_row_bounds_empty():
+    got = mde.file_row_bounds(np.zeros(0, dtype=np.int32), 3)
+    np.testing.assert_allclose(
+        got.astype(np.float64), np.zeros(4), rtol=0, atol=0
+    )
+
+
+def test_file_bounds_empty_and_single_row():
+    mins, maxs = mde.file_bounds(
+        np.zeros(0, dtype=np.int32),
+        [np.zeros(0, dtype=np.int64)],
+        np.array([0, 0], dtype=np.int32),
+    )
+    assert mins.shape == (1, 1) and maxs.shape == (1, 1)
+    assert (mins == 0).all() and (maxs == 0).all()
+
+    mins, maxs = mde.file_bounds(
+        np.array([0], dtype=np.int32),
+        [np.array([123456789012345], dtype=np.int64)],
+        np.array([0, 1], dtype=np.int32),
+    )
+    assert mins.tolist() == [[123456789012345]]
+    assert maxs.tolist() == [[123456789012345]]
+
+
+def test_file_bounds_rejects_short_bounds():
+    with pytest.raises(ValueError, match="nfiles \\+ 1"):
+        mde.file_bounds(
+            np.zeros(4, dtype=np.int32),
+            [np.zeros(4, dtype=np.int64)],
+            np.array([0], dtype=np.int32),
+        )
+
+
+def test_range_count_empty_and_reversed_range():
+    """Empty input counts nothing; lo > hi is an empty range, not an error.
+
+    This matches the closed-range predicate `lo <= key <= hi` evaluated per
+    row, which no key satisfies when lo > hi (verified in probe output).
+    """
+    assert mde.range_count(np.zeros(0, dtype=np.int64), 0, 10) == 0
+    assert mde.range_count(np.array([1, 2, 3], dtype=np.int64), 5, 2) == 0
+
+
+def test_range_counts_empty_and_mismatched():
+    got = mde.range_counts(
+        np.zeros(0, dtype=np.int64),
+        np.zeros(3, dtype=np.int64),
+        np.ones(3, dtype=np.int64),
+    )
+    np.testing.assert_allclose(
+        got.astype(np.float64), np.zeros(3), rtol=0, atol=0
+    )
+    assert mde.range_counts(
+        np.zeros(4, dtype=np.int64),
+        np.zeros(0, dtype=np.int64),
+        np.zeros(0, dtype=np.int64),
+    ).tolist() == []
+    with pytest.raises(ValueError, match="same length"):
+        mde.range_counts(
+            np.zeros(4, dtype=np.int64),
+            np.zeros(2, dtype=np.int64),
+            np.zeros(3, dtype=np.int64),
+        )
+
+
+def test_range_count_rejects_two_dimensional_keys():
+    with pytest.raises(ValueError, match="one-dimensional"):
+        mde.range_count(np.zeros((2, 2), dtype=np.int64), 0, 1)
+
+
+def test_prefix_rank_empty_and_single():
+    assert mde.prefix_rank(np.zeros(0, dtype=np.int64), 10).tolist() == []
+    np.testing.assert_allclose(
+        mde.prefix_rank(np.array([5], dtype=np.int64), 10).astype(np.float64),
+        np.array([0.0]), rtol=0, atol=0,
+    )
+
+
+def test_prefix_rank_rejects_impossible_widths():
+    with pytest.raises(ValueError, match="prefix_bits"):
+        mde.prefix_rank(np.zeros(4, dtype=np.int64), 64)
+    with pytest.raises(ValueError, match="prefix_bits"):
+        mde.prefix_rank(np.zeros(4, dtype=np.int64), -5)
+
+
+def test_float_bits_empty_and_two_dimensional():
+    assert mde.sortable_float_bits(np.zeros(0)).tolist() == []
+    assert mde.zorder_float_bits(np.zeros(0)).tolist() == []
+    with pytest.raises(ValueError, match="one-dimensional"):
+        mde.sortable_float_bits(np.zeros((2, 2)))
+    with pytest.raises(ValueError, match="one-dimensional"):
+        mde.zorder_float_bits(np.zeros((2, 2)))
+
+
+def test_float_bits_nan_places_above_inf():
+    """NaN's bit pattern (0x7FF8...) is above +inf (0x7FF0...) in both images.
+
+    This matches np.sort, which also places NaN last; a transform that put
+    NaN below +inf would disagree with every NumPy statistic.
+    """
+    values = np.array([np.inf, np.nan])
+    assert mde.sortable_float_bits(values)[1] > mde.sortable_float_bits(values)[0]
+    assert (mde.zorder_float_bits(values)[1] > mde.zorder_float_bits(values)[0]).all()
+
+
+def test_zorder_rewrite_empty():
+    """n=0, nfiles=2: every stage has a defined empty value, none may crash."""
+    res = mde.zorder_rewrite([np.zeros(0, dtype=np.int64)], nfiles=2)
+    assert res.keys.tolist() == []
+    assert res.order.tolist() == []
+    assert res.split.tolist() == [0, 0, 0]
+    assert res.row_files.tolist() == []
+    assert res.row_bounds.tolist() == [0, 0, 0]
+    assert res.mins.tolist() == [[0], [0]]
+    assert res.maxs.tolist() == [[0], [0]]
+
+
+def test_zorder_rewrite_duplicate_keys_all_land_in_last_file():
+    """Constant keys collapse every split to the same boundary.
+
+    assign_files gives every row to the last file, file_row_bounds puts 0,0,0,n,
+    and the statistics of the two empty files are 0/0 -- asserted exactly.
+    """
+    values = np.array([7 << 44] * 4, dtype=np.int64)
+    res = _rewrite([values], nfiles=3, bits=20)
+    assert res.keys.tolist() == [7, 7, 7, 7]
+    assert res.order.tolist() == [0, 1, 2, 3]
+    assert res.split.tolist() == [7, 7, 7, 7]
+    assert res.row_files.tolist() == [2, 2, 2, 2]
+    assert res.row_bounds.tolist() == [0, 0, 0, 4]
+    assert res.mins.tolist() == [[0], [0], [7 << 44]]
+    assert res.maxs.tolist() == [[0], [0], [7 << 44]]
+
+
+def test_zorder_rewrite_float_nan_sorts_last():
+    """NaN in a float column must sort above every finite value.
+
+    The key image puts NaN just above +inf, and the sortable image does too,
+    so the NaN row is last in the order and carries the maximum statistic.
+    This is the bit-pattern order the transform defines for every pattern;
+    np.min/np.max would propagate NaN instead, which is a different statistic
+    and deliberately not what file_bounds computes.
+    """
+    values = np.array([1.0, np.nan, 3.0])
+    res = _rewrite([values], nfiles=2, bits=20, mode=mde.MODE_FLOAT)
+    assert res.order.tolist() == [0, 2, 1]
+    nan_image = mde.sortable_float_bits(np.array([np.nan]))[0]
+    assert res.maxs[1, 0] == nan_image
+
+
+def test_zorder_rewrite_rejects_zero_files():
+    with pytest.raises(ValueError, match="at least 1"):
+        mde.zorder_rewrite([np.zeros(4, dtype=np.int64)], nfiles=0)
+    with pytest.raises(ValueError, match="at least 1"):
+        mde.zorder_rewrite([np.zeros(4, dtype=np.int64)], nfiles=-1)
+
+
+def test_prune_files_empty_and_rejects():
+    assert mde.prune_files(
+        np.zeros((0, 1)), np.zeros((0, 1)), 0, 0, 1
+    ).tolist() == []
+    with pytest.raises(ValueError, match="same shape"):
+        mde.prune_files(np.zeros((2, 1)), np.zeros((3, 1)), 0, 0, 1)
+    with pytest.raises(IndexError):
+        mde.prune_files(np.zeros((2, 1)), np.zeros((2, 1)), 5, 0, 1)
+
+
+def test_prune_rows_empty():
+    got = mde.prune_rows(
+        np.zeros(0, dtype=np.int64), np.array([0, 0, 0], dtype=np.int64)
+    )
+    np.testing.assert_allclose(
+        got.astype(np.float64), np.zeros(2), rtol=0, atol=0
+    )
+    assert mde.prune_rows(
+        np.zeros(4, dtype=np.int64), np.zeros(0, dtype=np.int64)
+    ).tolist() == []
+    assert mde.prune_rows(
+        np.zeros(4, dtype=np.int64), np.zeros(1, dtype=np.int64)
+    ).tolist() == []

@@ -227,6 +227,10 @@ def file_row_bounds(row_files, nfiles: int) -> np.ndarray:
     this and not by recomputing an index split, and it stays monotone even when
     a trailing file ends up empty.
     """
+    # Matches file_row_bounds validation of split_points: nfiles >= 1, else the
+    # boundary vector cannot hold nfiles + 1 entries.
+    if nfiles < 1:
+        raise ValueError("nfiles must be at least 1")
     row_files = _i32(row_files)
     return np.searchsorted(
         row_files, np.arange(nfiles + 1), side="left"
@@ -250,9 +254,20 @@ def file_bounds(order, columns, row_bounds) -> tuple[np.ndarray, np.ndarray]:
         raise ValueError("row_bounds must hold nfiles + 1 boundaries")
     if bounds[0] != 0 or bounds[-1] != order.size:
         raise ValueError("row_bounds must span every row of order")
+    # Matches file_bounds validation of assign_files/file_row_bounds: every
+    # boundary must lie in [0, n] and be non-decreasing, else the Mojo kernel
+    # would read out of bounds or silently describe the wrong rows.
+    if bounds.size and (bounds.min() < 0 or bounds.max() > order.size):
+        raise ValueError("row_bounds must lie within [0, row count]")
+    if bounds.size > 1 and np.any(bounds[1:] < bounds[:-1]):
+        raise ValueError("row_bounds must be non-decreasing")
     buf, kcols, n = _stack(columns, 1, MODE_INT)
     if order.size != n:
         raise ValueError("order and columns must have the same row count")
+    # Matches file_bounds validation of assign_files: every order entry must be
+    # a valid row index, else the Mojo kernel would read out of bounds.
+    if order.size and (order.min() < 0 or order.max() >= order.size):
+        raise ValueError("order entries must be valid row indices")
     omin = np.zeros(nfiles * kcols, dtype=np.int64)
     omax = np.zeros(nfiles * kcols, dtype=np.int64)
     lib.de_file_bounds(_addr(order), _addr(buf), _addr(bounds), n, kcols,
